@@ -3,6 +3,8 @@
 
 from __future__ import unicode_literals
 
+import six
+
 import re, copy, os
 import frappe
 from frappe import _
@@ -13,7 +15,7 @@ from frappe.model.document import Document
 from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 from frappe.desk.notifications import delete_notification_count_for
 from frappe.modules import make_boilerplate
-from frappe.model.db_schema import validate_column_name, validate_column_length
+from frappe.model.db_schema import validate_column_name, validate_column_length, type_map
 import frappe.website.render
 
 # imports - third-party imports
@@ -203,6 +205,7 @@ class DocType(Document):
 	def on_update(self):
 		"""Update database schema, make controller templates if `custom` is not set and clear cache."""
 		from frappe.model.db_schema import updatedb
+		self.delete_duplicate_custom_fields()
 		updatedb(self.name, self)
 
 		self.change_modified_of_parent()
@@ -233,6 +236,17 @@ class DocType(Document):
 		# clear from local cache
 		if self.name in frappe.local.meta_cache:
 			del frappe.local.meta_cache[self.name]
+
+	def delete_duplicate_custom_fields(self):
+		if not (frappe.db.table_exists(self.name) and frappe.db.table_exists("Custom Field")):
+			return
+		fields = [d.fieldname for d in self.fields if d.fieldtype in type_map]
+
+		frappe.db.sql('''delete from
+				`tabCustom Field`
+			where
+				 dt = {0} and fieldname in ({1})
+		'''.format('%s', ', '.join(['%s'] * len(fields))), tuple([self.name] + fields), as_dict=True)
 
 	def sync_global_search(self):
 		'''If global search settings are changed, rebuild search properties for this table'''
@@ -381,11 +395,16 @@ class DocType(Document):
 
 		# a DocType's name should not start with a number or underscore
 		# and should only contain letters, numbers and underscore
-		is_a_valid_name = re.match("^(?![\W])[^\d_\s][\w -]+$", name, re.UNICODE)
+		if six.PY2:
+			is_a_valid_name = re.match("^(?![\W])[^\d_\s][\w -]+$", name)
+		else:
+			is_a_valid_name = re.match("^(?![\W])[^\d_\s][\w -]+$", name, flags = re.ASCII)
 		if not is_a_valid_name:
 			frappe.throw(_("DocType's name should start with a letter and it can only consist of letters, numbers, spaces and underscores"), frappe.NameError)
 
 def validate_fields_for_doctype(doctype):
+	doc = frappe.get_doc("DocType", doctype)
+	doc.delete_duplicate_custom_fields()
 	validate_fields(frappe.get_meta(doctype, cached=False))
 
 # this is separate because it is also called via custom field
@@ -620,6 +639,7 @@ def validate_fields(meta):
 	for d in fields:
 		if not d.permlevel: d.permlevel = 0
 		if d.fieldtype != "Table": d.allow_bulk_edit = 0
+		if d.fieldtype == "Barcode": d.ignore_xss_filter = 1
 		if not d.fieldname:
 			frappe.throw(_("Fieldname is required in row {0}").format(d.idx))
 		d.fieldname = d.fieldname.lower()
